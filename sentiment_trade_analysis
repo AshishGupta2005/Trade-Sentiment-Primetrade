@@ -1,0 +1,204 @@
+"""
+Trader Performance vs. Bitcoin Market Sentiment
+
+Merges Hyperliquid trade-level data with the daily Bitcoin Fear & Greed
+Index and reports how profitability, win rate, risk, and activity vary
+across sentiment regims.
+"""
+import argparse
+import os
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+
+SENTIMENT_ORDER = ["Extreme Fear", "Fear", "Neutral", "Greed", "Extreme Greed"]
+SENTIMENT_COLORS = ["#7f1d1d", "#dc2626", "#9ca3af", "#16a34a", "#14532d"]
+
+# Data loading & merging
+
+def load_and_merge(trades_path: str, sentiment_path: str) -> pd.DataFrame:
+    """Load the two raw datasets and left-join trades to daily sentiment."""
+    trades = pd.read_csv(trades_path)
+    trades["dt"] = pd.to_datetime(trades["Timestamp IST"], format="%d-%m-%Y %H:%M")
+    trades["date"] = trades["dt"].dt.normalize()
+
+    sentiment = pd.read_excel(sentiment_path)
+    sentiment["date"] = pd.to_datetime(sentiment["date"]).dt.normalize()
+    sentiment = sentiment[["date", "classification", "value"]].rename(
+        columns={"classification": "sentiment", "value": "fg_value"}
+    )
+
+    merged = trades.merge(sentiment, on="date", how="left")
+
+    n_unmatched = merged["sentiment"].isnull().sum()
+    if n_unmatched:
+        print(f"Warning: {n_unmatched} of {len(merged)} trade rows had no "
+              f"matching sentiment date and were left as NaN.")
+
+    return merged
+
+
+def tag_position_type(direction: str) -> str:
+    """Classify a Direction value as Long / Short / Other (spot, deleverage, etc.)."""
+    if "Long" in direction:
+        return "Long"
+    if "Short" in direction:
+        return "Short"
+    return "Other"
+
+# Metrics
+
+def build_summary(merged: pd.DataFrame) -> pd.DataFrame:
+    """Core per-sentiment metrics table. 'Closed' trades = non-zero Closed PnL."""
+    closed = merged[merged["Closed PnL"] != 0].copy()
+
+    active_days = merged.groupby("sentiment")["date"].nunique()
+    trade_counts = merged.groupby("sentiment").size()
+
+    summary = pd.DataFrame({
+        "n_fills": trade_counts,
+        "n_closed_trades": closed.groupby("sentiment").size(),
+        "total_closed_pnl": closed.groupby("sentiment")["Closed PnL"].sum(),
+        "avg_pnl_per_closed_trade": closed.groupby("sentiment")["Closed PnL"].mean(),
+        "median_pnl_per_closed_trade": closed.groupby("sentiment")["Closed PnL"].median(),
+        "win_rate_pct": closed.groupby("sentiment")["Closed PnL"].apply(lambda x: (x > 0).mean() * 100),
+        "pnl_std_dev": closed.groupby("sentiment")["Closed PnL"].std(),
+        "total_volume_usd": merged.groupby("sentiment")["Size USD"].sum(),
+        "total_fees_usd": merged.groupby("sentiment")["Fee"].sum(),
+        "active_days": active_days,
+        "avg_fills_per_active_day": trade_counts / active_days,
+    }).reindex(SENTIMENT_ORDER)
+
+    return summary
+
+
+def long_short_breakdown(merged: pd.DataFrame) -> pd.DataFrame:
+    """Closed PnL split by sentiment and Long/Short. Rows without a clear
+    long/short tag (spot Sell, Auto-Deleveraging, etc.) are excluded — see
+    the 'n_other_excluded' column for how many/how much that omits."""
+    closed = merged[merged["Closed PnL"] != 0].copy()
+    closed["pos_type"] = closed["Direction"].apply(tag_position_type)
+
+    ls = (closed[closed["pos_type"] != "Other"]
+          .groupby(["sentiment", "pos_type"])["Closed PnL"]
+          .agg(["count", "sum", "mean"])
+          .rename(columns={"count": "n", "sum": "total_pnl", "mean": "avg_pnl"}))
+
+    other = closed[closed["pos_type"] == "Other"]
+    excluded = other.groupby("sentiment").agg(
+        n_other_excluded=("Closed PnL", "count"),
+        other_pnl_excluded=("Closed PnL", "sum"),
+    )
+    return ls, excluded
+
+
+def sentiment_pnl_correlation(merged: pd.DataFrame) -> float:
+    daily = (merged.groupby("date")
+             .agg(daily_pnl=("Closed PnL", "sum"), fg_value=("fg_value", "mean"))
+             .dropna())
+    return daily["fg_value"].corr(daily["daily_pnl"])
+
+# Charts
+
+def _bar_with_labels(ax, x_labels, values, colors, ylabel, title, fmt):
+    bars = ax.bar(x_labels, values, color=colors)
+    ax.set_ylabel(ylabel)
+    ax.set_title(title)
+    for b, v in zip(bars, values):
+        ax.text(b.get_x() + b.get_width() / 2, b.get_height(), fmt(v),
+                 ha="center", va="bottom", fontsize=9)
+
+
+def make_charts(merged: pd.DataFrame, summary: pd.DataFrame, ls: pd.DataFrame, outdir: str):
+    plt.rcParams.update({"font.size": 11, "font.family": "sans-serif"})
+    order, colors = SENTIMENT_ORDER, SENTIMENT_COLORS
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    _bar_with_labels(ax, order, summary["total_closed_pnl"].values / 1e6, colors,
+                      "Total Closed PnL (Million USD)", "Total Trader Profit by Market Sentiment",
+                      lambda v: f"${v:.2f}M")
+    fig.tight_layout(); fig.savefig(os.path.join(outdir, "chart_total_pnl.png"), dpi=150); plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    _bar_with_labels(ax, order, summary["win_rate_pct"].values, colors,
+                      "Win Rate (%)", "Trade Win Rate by Market Sentiment", lambda v: f"{v:.1f}%")
+    ax.set_ylim(0, 100)
+    fig.tight_layout(); fig.savefig(os.path.join(outdir, "chart_win_rate.png"), dpi=150); plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    _bar_with_labels(ax, order, summary["avg_pnl_per_closed_trade"].values, colors,
+                      "Average PnL per Closed Trade (USD)", "Average Profit per Trade by Market Sentiment",
+                      lambda v: f"${v:.0f}")
+    fig.tight_layout(); fig.savefig(os.path.join(outdir, "chart_avg_pnl.png"), dpi=150); plt.close(fig)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    _bar_with_labels(ax, order, summary["total_volume_usd"].values / 1e6, colors,
+                      "Total Trade Volume (Million USD)", "Total Trading Volume by Market Sentiment",
+                      lambda v: f"${v:.1f}M")
+    fig.tight_layout(); fig.savefig(os.path.join(outdir, "chart_volume.png"), dpi=150); plt.close(fig)
+
+    long_pnl = ls.xs("Long", level="pos_type")["total_pnl"].reindex(order)
+    short_pnl = ls.xs("Short", level="pos_type")["total_pnl"].reindex(order)
+    fig, ax = plt.subplots(figsize=(9, 5.5))
+    x = np.arange(len(order)); w = 0.35
+    ax.bar(x - w / 2, long_pnl / 1e3, width=w, label="Long", color="#2563eb")
+    ax.bar(x + w / 2, short_pnl / 1e3, width=w, label="Short", color="#ea580c")
+    ax.set_xticks(x); ax.set_xticklabels(order)
+    ax.set_ylabel("Total Closed PnL (Thousand USD)")
+    ax.set_title("Long vs Short Total PnL by Market Sentiment (directional trades only)")
+    ax.legend()
+    fig.tight_layout(); fig.savefig(os.path.join(outdir, "chart_long_short.png"), dpi=150); plt.close(fig)
+
+    daily = (merged.groupby("date")
+             .agg(daily_pnl=("Closed PnL", "sum"), fg_value=("fg_value", "mean"))
+             .dropna())
+    fig, ax1 = plt.subplots(figsize=(11, 5))
+    ax1.bar(daily.index, daily["daily_pnl"] / 1e3, color="#4f46e5", alpha=0.6, width=1, label="Daily PnL")
+    ax1.set_ylabel("Daily Closed PnL (Thousand USD)", color="#4f46e5")
+    ax2 = ax1.twinx()
+    ax2.plot(daily.index, daily["fg_value"], color="#dc2626", linewidth=1.2, label="Fear & Greed Index")
+    ax2.set_ylabel("Fear & Greed Index Value", color="#dc2626")
+    ax1.set_title("Daily Trader PnL vs. Fear & Greed Index Over Time")
+    fig.tight_layout(); fig.savefig(os.path.join(outdir, "chart_timeseries.png"), dpi=150); plt.close(fig)
+
+# Main
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--trades", default="historical_data.csv", help="Path to Hyperliquid trade CSV")
+    parser.add_argument("--sentiment", default="fear_greed_index.xlsx", help="Path to Fear & Greed Index xlsx")
+    parser.add_argument("--outdir", default="./output", help="Directory to write CSVs and charts to")
+    args = parser.parse_args()
+
+    os.makedirs(args.outdir, exist_ok=True)
+
+    print(f"Loading trades from {args.trades} and sentiment from {args.sentiment} ...")
+    merged = load_and_merge(args.trades, args.sentiment)
+
+    keep_cols = ["Account", "Coin", "Execution Price", "Size Tokens", "Size USD", "Side",
+                 "Direction", "Closed PnL", "Fee", "date", "sentiment", "fg_value"]
+    merged[keep_cols].to_csv(os.path.join(args.outdir, "merged_trades_with_sentiment.csv"), index=False)
+
+    summary = build_summary(merged)
+    summary.to_csv(os.path.join(args.outdir, "summary_by_sentiment.csv"))
+    print("\n=== Summary by sentiment ===")
+    print(summary.round(2).to_string())
+
+    ls, excluded = long_short_breakdown(merged)
+    print("\n=== Long vs Short closed PnL by sentiment ===")
+    print(ls.round(2).to_string())
+    print("\n=== Trades excluded from long/short split (spot Sell, deleverage, etc.) ===")
+    print(excluded.round(2).to_string())
+
+    corr = sentiment_pnl_correlation(merged)
+    print(f"\nCorrelation between daily Fear & Greed value and daily closed PnL: {corr:.4f}")
+
+    make_charts(merged, summary, ls, args.outdir)
+    print(f"\nCharts and CSVs written to {os.path.abspath(args.outdir)}")
+
+
+if __name__ == "__main__":
+    main()
